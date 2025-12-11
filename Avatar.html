@@ -1,0 +1,385 @@
+<html>
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Avatar + Clear CONSTS</title>
+    <script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
+    <style>
+        body {
+            font-family: system-ui, Arial, sans-serif;
+            margin: 24px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .card {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 16px;
+        }
+
+        .row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 8px 12px;
+            border: 1px solid #444;
+            background: #fff;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        label {
+            display: block;
+            margin: 8px 0 4px;
+        }
+
+        #remoteVideo {
+            width: 100%;
+            min-height: 240px;
+            display: grid;
+            place-items: center;
+            background: #f7f7f7;
+            border-radius: 6px;
+        }
+
+        #chatHistory {
+            width: 100%;
+            height: 220px;
+            white-space: pre-wrap;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            padding: 10px;
+            overflow-y: auto;
+            background: #fcfcfc;
+        }
+
+        #userInput {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #444;
+            border-radius: 6px;
+            font-size: 16px;
+        }
+
+        .hint {
+            color: #666;
+            font-size: 12px;
+        }
+
+        pre {
+            background: #f4f4f4;
+            padding: 10px;
+            border-radius: 6px;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Talking Avatar</h1>
+    <p class="hint">Configure CONSTS at the top, start the session, then type a message or use mic. Replace the stubbed
+        reply with your backend when ready.</p>
+    <div class="card">
+        <h3>CONSTS (edit these)</h3>
+        <pre id="constsView"></pre>
+        <p class="hint">
+            For production: wire and replace local replies
+        </p>
+    </div>
+
+    <div class="grid" style="margin-top: 16px;">
+        <div class="card">
+            <h3>Session Controls</h3>
+            <div class="row">
+                <button id="startBtn" class="btn">Start Session</button>
+                <button id="stopBtn" class="btn" disabled>Stop Session</button>
+                <button id="micBtn" class="btn" disabled>Start Microphone</button>
+            </div>
+
+            <div id="remoteVideo" style="margin-top: 12px;">Avatar video appears here</div>
+            <audio id="avatarAudio" autoplay></audio>
+
+            <div style="margin-top: 12px;">
+                <label>Speech Region (override)</label>
+                <input id="speechRegionInput" type="text" placeholder="override CONSTS.SPEECH_REGION" />
+                <label>Speech Key (for local testing only)</label>
+                <input id="speechKeyInput" type="password" placeholder="paste key; better use /api/speech-token" />
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Chat</h3>
+            <div id="chatHistory"></div>
+
+            <label style="margin-top: 12px;">Message (press Enter to send)</label>
+            <input id="userInput" type="text" placeholder="Type your message…" />
+
+            <p class="hint" style="margin-top:8px;">
+                Assistant replies are local and spoken by the avatar when active.
+                Replace the stubbed reply with your call.
+            </p>
+        </div>
+    </div>
+
+    <script>
+        // ===== CONSTS — EDIT THESE =====
+        const CONSTS = {
+            // Speech service
+            SPEECH_REGION: 'eastus',
+            // Leave empty to rely on server token; paste only for local testing
+            SPEECH_KEY: '',
+            // TTS / Avatar
+            TTS_VOICE: 'en-US-AndrewMultilingualNeural',
+            AVATAR_CHARACTER: 'lisa',
+            AVATAR_STYLE: 'casual-sitting',
+            STT_LOCALES: ['en-US'],
+
+            // Server endpoints (recommended for production)
+            ENDPOINTS: {
+                // GET returns { token, region }
+                SPEECH_TOKEN: '/api/speech-token',
+                // GET returns { Urls, Username, Password }
+                AVATAR_RELAY_TOKEN: '/api/avatar-relay-token',
+                // POST { messages } returns stream or final { content }
+                CHAT_PROXY: '/api/chat'
+            },
+
+            // Feature flags
+            USE_SERVER_SPEECH_TOKEN: true,   // if true, call /api/speech-token; else use SPEECH_KEY directly
+            USE_SERVER_RELAY_TOKEN: true,    // if true, call /api/avatar-relay-token; else fetch via SPEECH_REGION + SPEECH_KEY
+            USE_LOCAL_REPLY: true            // if true, use local stubbed reply; set false and wire CHAT_PROXY
+        };
+        // Show CONSTS for easy discovery
+        document.getElementById('constsView').textContent = JSON.stringify(CONSTS, null, 2);
+
+        // ===== State =====
+        let peerConnection = null;
+        let avatarSynthesizer = null;
+        let speechRecognizer = null;
+        let isSpeaking = false;
+        let speakQueue = [];
+        let sessionActive = false;
+        const messages = []; // {role, content}
+
+        // ===== Helpers =====
+        function getInputOverrides() {
+            const regionOverride = document.getElementById('speechRegionInput').value.trim();
+            const keyOverride = document.getElementById('speechKeyInput').value.trim();
+            return {
+                region: regionOverride || CONSTS.SPEECH_REGION,
+                key: keyOverride || CONSTS.SPEECH_KEY
+            };
+        }
+
+        function append(role, content) {
+            messages.push({ role, content });
+            const box = document.getElementById('chatHistory');
+            box.textContent += (role === 'user' ? 'User: ' : 'Assistant: ') + content + '\\n\\n';
+            box.scrollTop = box.scrollHeight;
+        }
+
+        function htmlEncode(text) {
+            const m = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '/': '&#x2F;' };
+            return String(text).replace(/[&<>"'\/]/g, (x) => m[x]);
+        }
+
+        // ===== Speech SDK init (token vs key) =====
+        async function makeSpeechConfig() {
+            const { region, key } = getInputOverrides();
+
+            if (CONSTS.USE_SERVER_SPEECH_TOKEN) {
+                // Recommended: get short-lived token from server
+                const resp = await fetch(CONSTS.ENDPOINTS.SPEECH_TOKEN);
+                if (!resp.ok) throw new Error('Failed to fetch speech token');
+                const { token, region: serverRegion } = await resp.json();
+                const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(token, serverRegion || region);
+                return speechConfig;
+            } else {
+                if (!region || !key) throw new Error('Provide SPEECH_REGION and SPEECH_KEY (or enable USE_SERVER_SPEECH_TOKEN)');
+                return SpeechSDK.SpeechConfig.fromSubscription(key, region);
+            }
+        }
+
+        async function getRelayIce() {
+            const { region, key } = getInputOverrides();
+
+            if (CONSTS.USE_SERVER_RELAY_TOKEN) {
+                const resp = await fetch(CONSTS.ENDPOINTS.AVATAR_RELAY_TOKEN);
+                if (!resp.ok) throw new Error('Failed to fetch relay token');
+                const relay = await resp.json();
+                return { urls: relay.Urls, username: relay.Username, credential: relay.Password };
+            } else {
+                if (!region || !key) throw new Error('Provide SPEECH_REGION and SPEECH_KEY (or enable USE_SERVER_RELAY_TOKEN)');
+                const resp = await fetch(`https://${region}.tts.speech.microsoft.com/cognitiveservices/avatar/relay/token/v1`, {
+                    method: 'GET',
+                    headers: { 'Ocp-Apim-Subscription-Key': key }
+                });
+                if (!resp.ok) throw new Error(`Relay token HTTP ${resp.status}`);
+                const relay = await resp.json();
+                return { urls: relay.Urls, username: relay.Username, credential: relay.Password };
+            }
+        }
+
+        function makeSpeak(avatarSynthesizer) {
+            const speakText = async (text) => {
+                const ssml =
+                    "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>" +
+                    `<voice name='${CONSTS.TTS_VOICE}'>${htmlEncode(text)}</voice>` +
+                    "</speak>";
+                isSpeaking = true;
+                try { await avatarSynthesizer.speakSsmlAsync(ssml); }
+                catch (err) { console.error('TTS error', err); }
+                finally {
+                    if (speakQueue.length) speakText(speakQueue.shift()); else isSpeaking = false;
+                }
+            };
+            return (text) => isSpeaking ? speakQueue.push(text) : speakText(text);
+        }
+
+        function generateLocalReply(userText) {
+            const trimmed = userText.replace(/\\s+/g, ' ').trim();
+            if (!trimmed) return 'Could you repeat that?';
+            const base = 'Thanks; I noted your request';
+            const extras = ['Let’s keep messages concise.', 'One moment while I consider that.', 'Got it; how would you like to continue?'];
+            return `${base}. ${extras[Math.floor(Math.random() * extras.length)]}`;
+        }
+
+        async function fetchAssistantReply(messages) {
+            if (CONSTS.USE_LOCAL_REPLY) {
+                const lastUser = messages.slice().reverse().find(m => m.role === 'user');
+                return generateLocalReply(lastUser ? lastUser.content : '');
+            }
+            // Replace with your backend call (AI Foundry proxy):
+            // const resp = await fetch(CONSTS.ENDPOINTS.CHAT_PROXY, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ messages }) });
+            // const data = await resp.json(); return data.content;
+            throw new Error('Set USE_LOCAL_REPLY=true or implement CHAT_PROXY call.');
+        }
+
+        // ===== Session lifecycle =====
+        async function startSession() {
+            try {
+                const speechConfig = await makeSpeechConfig();
+                const avatarConfig = new SpeechSDK.AvatarConfig(CONSTS.AVATAR_CHARACTER, CONSTS.AVATAR_STYLE);
+                avatarSynthesizer = new SpeechSDK.AvatarSynthesizer(speechConfig, avatarConfig);
+                window.speak = makeSpeak(avatarSynthesizer);
+
+                // STT (mic)
+                try {
+                    const { region, key } = getInputOverrides();
+                    // When using server token, STT prefers authorization token too, but this endpoint form works with key.
+                    const sttConfig = SpeechSDK.SpeechConfig.fromEndpoint(new URL(`wss://${region}.stt.speech.microsoft.com/speech/universal/v2`), key || ''); // key only needed if not using server token
+                    sttConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_LanguageIdMode, 'Continuous');
+                    const autoLang = SpeechSDK.AutoDetectSourceLanguageConfig.fromLanguages(CONSTS.STT_LOCALES.length ? CONSTS.STT_LOCALES : ['en-US']);
+                    speechRecognizer = SpeechSDK.SpeechRecognizer.FromConfig(sttConfig, autoLang, SpeechSDK.AudioConfig.fromDefaultMicrophoneInput());
+                    speechRecognizer.recognized = async (s, e) => {
+                        if (e.result.reason === SpeechSDK.ResultReason.RecognizedSpeech) {
+                            const userText = e.result.text.trim();
+                            if (!userText) return;
+                            append('user', userText);
+                            const assistant = await fetchAssistantReply(messages);
+                            append('assistant', assistant);
+                            if (sessionActive && avatarSynthesizer) speak(assistant);
+                        }
+                    };
+                } catch (e) {
+                    console.warn('STT init failed; mic disabled.', e);
+                }
+
+                // WebRTC / relay
+                const ice = await getRelayIce();
+                peerConnection = new RTCPeerConnection({ iceServers: [ice] });
+                peerConnection.ontrack = (event) => {
+                    if (event.track.kind === 'video') {
+                        const container = document.getElementById('remoteVideo');
+                        container.innerHTML = '';
+                        const video = document.createElement('video');
+                        video.autoplay = true; video.playsInline = true;
+                        video.srcObject = event.streams[0];
+                        video.style.width = '100%';
+                        container.appendChild(video);
+                    } else if (event.track.kind === 'audio') {
+                        const audio = document.getElementById('avatarAudio');
+                        audio.srcObject = event.streams[0];
+                    }
+                };
+                peerConnection.addTransceiver('video', { direction: 'sendrecv' });
+                peerConnection.addTransceiver('audio', { direction: 'sendrecv' });
+
+                const r = await avatarSynthesizer.startAvatarAsync(peerConnection);
+                if (r.reason !== SpeechSDK.ResultReason.SynthesizingAudioCompleted) throw new Error('Avatar failed to start');
+
+                sessionActive = true;
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+                document.getElementById('micBtn').disabled = !speechRecognizer;
+            } catch (e) {
+                console.error('Start session error', e);
+                alert('Failed to start session.');
+                cleanup();
+            }
+        }
+
+        function stopSession() {
+            cleanup();
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('micBtn').disabled = true;
+        }
+
+        function cleanup() {
+            sessionActive = false;
+            try { if (avatarSynthesizer) avatarSynthesizer.close(); } catch { }
+            try { if (speechRecognizer) speechRecognizer.stopContinuousRecognitionAsync(() => { }, () => { }); } catch { }
+            try { if (speechRecognizer) speechRecognizer.close(); } catch { }
+            try { if (peerConnection) peerConnection.close(); } catch { }
+            avatarSynthesizer = null; speechRecognizer = null; peerConnection = null;
+        }
+
+        function toggleMic() {
+            if (!speechRecognizer) return;
+            const btn = document.getElementById('micBtn');
+            if (btn.textContent.includes('Start')) {
+                btn.disabled = true;
+                speechRecognizer.startContinuousRecognitionAsync(() => {
+                    btn.textContent = 'Stop Microphone'; btn.disabled = false;
+                }, (err) => { console.error('Mic start error', err); btn.disabled = false; });
+            } else {
+                btn.disabled = true;
+                speechRecognizer.stopContinuousRecognitionAsync(() => {
+                    btn.textContent = 'Start Microphone'; btn.disabled = false;
+                }, (err) => { console.error('Mic stop error', err); btn.disabled = false; });
+            }
+        }
+
+        // ===== UI handlers =====
+        document.getElementById('startBtn').addEventListener('click', startSession);
+        document.getElementById('stopBtn').addEventListener('click', stopSession);
+        document.getElementById('micBtn').addEventListener('click', toggleMic);
+
+        document.getElementById('userInput').addEventListener('keyup', async (e) => {
+            if (e.key === 'Enter') {
+                const val = e.target.value.trim();
+                if (!val) return;
+                e.target.value = '';
+                append('user', val);
+                const assistant = await fetchAssistantReply(messages);
+                append('assistant', assistant);
+                if (sessionActive && avatarSynthesizer) { speak(assistant); }
+            }
+        });
+    </script>
+</body>
+</html>
